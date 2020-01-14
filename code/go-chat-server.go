@@ -5,7 +5,6 @@ import (
 	"net"
 	"os"
 	"strings"
-	"sync"
 	"time"
 )
 
@@ -17,62 +16,103 @@ Commands:
 	/whoami
 `
 
-type Connection struct {
-	Created time.Time
-	Name    string
+type Server struct {
+	forward chan []byte
+	join    chan *client
+	leave   chan *client
+	clients map[*client]bool
 }
 
-var connections map[net.Conn]*Connection
-var connectionsMutex sync.Mutex
+type client struct {
+	conn    net.Conn
+	Name    string
+	Created time.Time
+}
+
+func (s *Server) Run() {
+	go func() {
+		for {
+			select {
+			case message := <-s.forward:
+				for c := range s.clients {
+					c.conn.Write(message)
+				}
+
+			case c := <-s.leave:
+				delete(s.clients, c)
+
+			case c := <-s.join:
+				s.clients[c] = true
+			}
+		}
+	}()
+}
+
+func (s *Server) Join(client *client) {
+	s.join <- client
+}
+
+func (s *Server) Leave(client *client) {
+	s.leave <- client
+}
+
+func (s *Server) Broadcast(sender string, message string) {
+	b := []byte("[" + sender + "] " + message + "\n")
+	s.forward <- b
+}
+
+var server Server
 
 func main() {
-	srv, err := net.Listen("tcp", ":5678")
+	conn, err := net.Listen("tcp", ":5678")
 	if err != nil {
 		log.Fatalln(err)
 	}
-	defer srv.Close()
+	defer conn.Close()
 
-	connections = make(map[net.Conn]*Connection)
+	server = Server{
+		forward: make(chan []byte, 10),
+		join:    make(chan *client, 10),
+		clients: make(map[*client]bool),
+	}
 
 	log.Println("Listening for connections")
+	server.Run()
 	for {
-		c, err := srv.Accept()
+		c, err := conn.Accept()
 		if err != nil {
 			log.Println("Error accepting connection: ", err.Error())
 			os.Exit(1)
 		} else {
-			log.Println(c.RemoteAddr())
 			go handleConnection(c)
 		}
 	}
 }
 
-func handleConnection(c net.Conn) {
-	log.Println(c.RemoteAddr(), " CONNECTED")
+func handleConnection(conn net.Conn) {
+	log.Println(conn.RemoteAddr(), " CONNECTED")
 
-	connection := &Connection{
+	// Create the client
+	client := &client{
+		conn:    conn,
 		Created: time.Now(),
-		Name:    c.RemoteAddr().String(),
+		Name:    conn.RemoteAddr().String(),
 	}
 
-	// Add connection to the pool
-	connectionsMutex.Lock()
-	connections[c] = connection
-	connectionsMutex.Unlock()
+	// Add client to the pool
+	server.join <- client
 
 	// Remove self when connection closes
 	defer func() {
-		log.Println(c.RemoteAddr(), " DISCONNECTED")
-		connectionsMutex.Lock()
-		delete(connections, c)
-		connectionsMutex.Unlock()
+		log.Println(conn.RemoteAddr(), " DISCONNECTED")
+		server.leave <- client
 	}()
 
-	c.Write([]byte(Welcome))
+	conn.Write([]byte(Welcome))
 
 	b := make([]byte, 4096)
 	for {
-		n, err := c.Read(b)
+		n, err := conn.Read(b)
 		if err != nil {
 			return
 		}
@@ -80,9 +120,9 @@ func handleConnection(c net.Conn) {
 		if len(in) == 0 {
 			continue
 		}
-		log.Println(c.RemoteAddr(), " '"+in+"'")
+		log.Println(conn.RemoteAddr(), " '"+in+"'")
 		if in[0] != '/' {
-			broacast(connection.Name, in)
+			server.Broadcast(client.Name, in)
 		} else { // It's a command
 			command := strings.ToLower(in[1:])
 			params := ""
@@ -95,26 +135,16 @@ func handleConnection(c net.Conn) {
 
 			switch command {
 			case "nick":
-				connection.Name = params
-				broacast(connection.Name, "has set their nick name")
+				client.Name = params
+				conn.Write([]byte("Hence forth you shall be known as " + client.Name + "\n"))
+				server.Broadcast(client.Name, "has set their nick name")
 
 			case "whoami":
-				c.Write([]byte("You are " + connection.Name + "\n"))
+				conn.Write([]byte("You are " + client.Name + "\n"))
 
 			default:
-				c.Write([]byte("unknown command: " + command + "\n"))
+				conn.Write([]byte("Unknown command: " + command + "\n"))
 			}
 		}
-	}
-}
-
-func broacast(sender string, message string) {
-	connectionsMutex.Lock()
-	defer connectionsMutex.Unlock()
-
-	b := []byte("[" + sender + "] " + message + "\n")
-
-	for c := range connections {
-		c.Write(b)
 	}
 }
